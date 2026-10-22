@@ -89,6 +89,10 @@ def mmr_select(
     treated as maximally novel rather than dropped.
     """
 
+    # Fused queries can carry incomparable scores: their incoming order is
+    # the top-k contract when diversification is disabled.
+    if diversity == 0.0:
+        return hits[:k]
     if k >= len(hits) or not hits:
         return list(hits)
     lo = min(h["score"] for h in hits)

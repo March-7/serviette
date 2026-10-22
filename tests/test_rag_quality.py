@@ -299,6 +299,67 @@ def test_mmr_select_prefers_novelty_over_near_duplicates():
     assert [h["text"] for h in plain] == ["a", "a-dup"]
 
 
+@pytest.mark.parametrize("k", [1, 2, 3])
+def test_mmr_zero_preserves_incoming_order(k):
+    # Decomposed queries retain their own, incomparable scores. The incoming
+    # order is the retrieval contract, even when a later hit has a larger score.
+    hits = [
+        {"text": "a", "score": 0.8, "embedding": [1.0, 0.0]},
+        {"text": "b", "score": 1.0, "embedding": [0.0, 1.0]},
+        {"text": "c", "score": 0.7, "embedding": [1.0, 0.0]},
+    ]
+    assert [h["text"] for h in mmr_select(hits, k, diversity=0.0)] == ["a", "b", "c"][:k]
+
+
+@pytest.mark.parametrize(
+    ("diversity", "expected"),
+    [(0.25, ["b", "a"]), (0.5, ["b", "a"]), (1.0, ["a", "b"])],
+)
+def test_mmr_positive_diversity_keeps_relevance_and_novelty(diversity, expected):
+    hits = [
+        {"text": "a", "score": 0.8, "embedding": [1.0, 0.0]},
+        {"text": "b", "score": 1.0, "embedding": [0.0, 1.0]},
+        {"text": "c", "score": 0.7, "embedding": [1.0, 0.0]},
+    ]
+    assert [h["text"] for h in mmr_select(hits, 2, diversity)] == expected
+
+
+@pytest.mark.parametrize("k", [1, 2])
+def test_mmr_zero_preserves_decomposed_retrieval_order(tmp_path, k):
+    query, subquery = "combined question", "second fact"
+
+    class QueryEmbedder:
+        async def embed(self, text):
+            return [0.0, 1.0, 0.0] if text == subquery else [1.0, 0.0, 0.0]
+
+        async def close(self):
+            pass
+
+    path = tmp_path / "decomposed.duckdb"
+    write_duckdb_rows(
+        path,
+        [
+            {"id": "a", "text": "original-top", "embedding": [0.8, 0.0, 0.6]},
+            {"id": "b", "text": "second-hop-top", "embedding": [0.0, 1.0, 0.0]},
+            {"id": "c", "text": "runner-up", "embedding": [0.6, 0.0, 0.8]},
+        ],
+    )
+    expected = ["original-top", "second-hop-top"][:k]
+    # Compare the same real DuckDB / decomposition pipeline with MMR off and
+    # with zero diversity. A wider candidate pool must preserve the top-k order.
+    for mmr in (None, {"candidates": 3, "diversity": 0.0}):
+        app = _app(
+            path,
+            QueryEmbedder(),
+            llm=_DecomposingLLM([subquery]),
+            rag=RagConfig(decompose={"max_subqueries": 2}, mmr=mmr),
+        )
+        with TestClient(app) as client:
+            response = client.post("/api/v1/retrieve", json={"query": query, "k": k})
+        assert response.status_code == 200
+        assert [h["text"] for h in response.json()["results"]] == expected
+
+
 def test_mmr_endpoint_strips_embeddings(store_path, mock_server_embedder):
     rag = RagConfig(mmr={"candidates": 5, "diversity": 0.3})
     app = _app(store_path, mock_server_embedder, rag=rag)
